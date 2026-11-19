@@ -756,9 +756,9 @@ long mg_io_send(struct mg_connection *c, const void *buf, size_t len) {
     sent = tx_tcp(ifp, s->mac, dst_ip, TH_PUSH | TH_ACK, c->loc.port,
                   c->rem.port, mg_htonl(s->seq), mg_htonl(s->ack), buf, len);
     if (sent == 0 || sent == (size_t) -1) {
-      if (s->retransmit)  // not sent: the caller keeps the data and retries
+      if (s->retransmit && len > 0)  // not sent: caller keeps data, retries
         mg_iobuf_del(&s->txq, s->txq.len - len - sizeof(uint32_t),
-                     len + sizeof(uint32_t));
+                     len + sizeof(uint32_t));  // the record txq_add added
       return sent == 0 ? MG_IO_WAIT : MG_IO_ERR;
     }
     s->seq += (uint32_t) len;

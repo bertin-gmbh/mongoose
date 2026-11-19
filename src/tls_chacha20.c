@@ -1328,13 +1328,25 @@ PORTABLE_8439_DECL size_t mg_chacha20_poly1305_encrypt(
 
 PORTABLE_8439_DECL size_t mg_chacha20_poly1305_decrypt(
     uint8_t *restrict plain_text, const uint8_t key[RFC_8439_KEY_SIZE],
-    const uint8_t nonce[RFC_8439_NONCE_SIZE],
-    const uint8_t *restrict cipher_text, size_t cipher_text_size) {
+    const uint8_t nonce[RFC_8439_NONCE_SIZE], const uint8_t *restrict ad,
+    size_t ad_size, const uint8_t *restrict cipher_text,
+    size_t cipher_text_size) {
   // first we calculate the mac and see if it lines up, only then do we decrypt
-  size_t actual_size = cipher_text_size - RFC_8439_TAG_SIZE;
+  // (AS-115: 7.17 skipped the check, so tampered records were accepted)
+  uint8_t mac[RFC_8439_TAG_SIZE];
+  uint8_t diff = 0;
+  size_t i, actual_size;
+  if (cipher_text_size < RFC_8439_TAG_SIZE) return (size_t) -1;
+  actual_size = cipher_text_size - RFC_8439_TAG_SIZE;
   if (MG_OVERLAPPING(plain_text, actual_size, cipher_text, cipher_text_size)) {
     return (size_t) -1;
   }
+  poly1305_calculate_mac(mac, cipher_text, actual_size, key, nonce, ad,
+                         ad_size);
+  for (i = 0; i < RFC_8439_TAG_SIZE; i++) {  // constant time compare
+    diff |= (uint8_t) (mac[i] ^ cipher_text[actual_size + i]);
+  }
+  if (diff != 0) return (size_t) -1;
 
   chacha20_xor_stream(plain_text, cipher_text, actual_size, key, nonce, 1);
   return actual_size;

@@ -447,6 +447,7 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
     // certificate can be larger than MG_IO_SIZE and overflowed the heap
     uint8_t *enc = (uint8_t *) calloc(1, msgsz + 256 + 1);
     if (enc == NULL) {
+      wio->len -= sizeof(hdr);  // do not leave a header without its record
       mg_error(c, "TLS OOM");
       return;
     } else {
@@ -503,7 +504,7 @@ static int mg_tls_recv_record(struct mg_connection *c) {
 
   msgsz = MG_LOAD_BE16(rio->buf + 3);
   msg = rio->buf + 5;
-  if (msgsz < 16) {
+  if (msgsz < 17) {  // tag (16) + inner content type (1), else recv_len wraps
     mg_error(c, "wrong size");
     return -1;
   }
@@ -521,7 +522,13 @@ static int mg_tls_recv_record(struct mg_connection *c) {
       mg_error(c, "TLS OOM");
       return -1;
     }
-    n = mg_chacha20_poly1305_decrypt(dec, key, nonce, msg, msgsz);
+    // Additional data: the 5-byte record header (RFC 8446 5.2)
+    n = mg_chacha20_poly1305_decrypt(dec, key, nonce, rio->buf, 5, msg, msgsz);
+    if (n == (size_t) -1) {
+      free(dec);
+      mg_error(c, "TLS bad record MAC");
+      return -1;
+    }
     memmove(msg, dec, n);
     free(dec);
   }
@@ -744,7 +751,8 @@ static void finish_SHA256(const MG_UECC_HashContext *base,
 // Encode a big-endian unsigned integer as a minimal DER INTEGER (tag, length,
 // value): no leading 0x00 unless the next byte has its top bit set. Returns the
 // number of bytes written (at most len + 3).
-size_t mg_der_uint(uint8_t *out, const uint8_t *v, size_t len);  // host test
+// Not static only so that test/host can call it (test_mongoose_tls_flush.c)
+size_t mg_der_uint(uint8_t *out, const uint8_t *v, size_t len);
 size_t mg_der_uint(uint8_t *out, const uint8_t *v, size_t len) {
   size_t n = 0;
   while (len > 1 && v[0] == 0 && !(v[1] & 0x80)) v++, len--;
@@ -764,7 +772,6 @@ static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
   struct SHA256_HashContext ctx = {
       {&init_SHA256, &update_SHA256, &finish_SHA256, 64, 32, tmp},
       {{0}, 0, 0, {0}}};
-  int neg1, neg2;
   uint8_t sig[64] = {0};
 
   mg_tls_calc_cert_verify_hash(c, (uint8_t *) hash, is_client);
@@ -783,8 +790,6 @@ static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
     verify[9] = (uint8_t) (p - (verify + 10));
     sigsz = (size_t) (p - (verify + 8));
   }
-  (void) neg1;
-  (void) neg2;
   verifysz = 8U + sigsz;
   verify[3] = (uint8_t) (sigsz + 4);
   verify[7] = (uint8_t) sigsz;
