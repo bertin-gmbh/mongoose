@@ -4175,6 +4175,9 @@ void mg_mgr_init(struct mg_mgr *mgr) {
 #define MIP_TCP_SYN_MS 15000  // Timeout for connection establishment
 #define MIP_TCP_FIN_MS 1000   // Timeout for closing connection
 #define MIP_TCP_WIN 6000      // TCP window size
+#define MIP_TCP_RTX_MS 1000       // Initial retransmission timeout (RFC-6298, 2.1)
+#define MIP_TCP_RTX_MAX_MS 60000  // Retransmission timeout cap (RFC-6298, 2.5)
+#define MIP_TCP_TXQ_ALIGN 1024    // Retransmit queue allocation quantum
 
 struct connstate {
   uint32_t seq, ack;           // TCP seq/ack counters
@@ -4192,6 +4195,13 @@ struct connstate {
   struct mg_iobuf raw;   // For TLS only. Incoming raw data
   bool fin_rcvd;         // We have received FIN from the peer
   bool twclosure;        // 3-way closure done
+  // TCP retransmission, backport of Mongoose 7.24 (AS-115; RFC-6298, RFC-9293)
+  bool retransmit;       // Retain sent data until acknowledged
+  uint8_t txq_retries;   // Retransmissions since ACK progress
+  uint32_t txq_seq;      // Sequence of the first txq record
+  uint32_t txq_una;      // Oldest unacknowledged sequence
+  uint64_t txq_timer;    // Retransmission timer
+  struct mg_iobuf txq;   // Length-prefixed sent TCP segments
 };
 
 #pragma pack(push, 1)
@@ -4743,6 +4753,8 @@ static struct mg_connection *accept_conn(struct mg_connection *lsn,
   s->seq = mg_ntohl(pkt->tcp->ack), s->ack = mg_ntohl(pkt->tcp->seq);
   memcpy(s->mac, pkt->eth->src, sizeof(s->mac));
   settmout(c, MIP_TTYPE_KEEPALIVE);
+  s->retransmit = lsn->mgr->ifp->enable_tcp_retransmit;
+  s->txq.align = MIP_TCP_TXQ_ALIGN;
   memcpy(c->rem.ip, &pkt->ip->src, sizeof(uint32_t));
   c->rem.port = pkt->tcp->sport;
   MG_DEBUG(("%lu accepted %M", c->id, mg_print_ip_port, &c->rem));
@@ -4786,6 +4798,66 @@ static size_t trim_len(struct mg_connection *c, size_t len) {
   return len;
 }
 
+// TCP retransmission queue (backport of Mongoose 7.24, AS-115)
+static size_t txq_next(struct connstate *s, uint8_t **buf) {
+  uint32_t len;
+  if (s->txq.len < sizeof(len)) return 0;
+  memcpy(&len, s->txq.buf, sizeof(len));
+  if (len == 0 || len > s->txq.len - sizeof(len)) return 0;
+  if (buf != NULL) *buf = s->txq.buf + sizeof(len);
+  return len;
+}
+
+static bool txq_add(struct connstate *s, const void *buf, size_t len) {
+  uint32_t n = (uint32_t) len;
+  size_t off = s->txq.len, total = sizeof(n) + len;
+  if (len == 0) return true;
+  if (mg_iobuf_add(&s->txq, off, NULL, total) != total) return false;
+  memcpy(s->txq.buf + off, &n, sizeof(n));
+  memcpy(s->txq.buf + off + sizeof(n), buf, len);
+  return true;
+}
+
+// Peer acknowledged up to ackno: drop entirely acknowledged segments
+// (RFC-9293, 3.10.7.4) and restart the RTO (RFC-6298, 5.3)
+static void txq_ack(struct connstate *s, uint32_t ackno, uint64_t now) {
+  size_t len;
+  if (s->txq.len == 0) return;
+  if ((int32_t) (ackno - s->txq_una) <= 0) return;  // old or duplicate ACK
+  if ((int32_t) (ackno - s->seq) > 0) return;       // ACKs unsent data
+  while ((len = txq_next(s, NULL)) > 0 &&
+         (int32_t) (ackno - (s->txq_seq + (uint32_t) len)) >= 0) {
+    mg_iobuf_del(&s->txq, 0, len + sizeof(uint32_t));
+    s->txq_seq += (uint32_t) len;
+  }
+  s->txq_una = ackno;
+  s->txq_retries = 0;
+  s->txq_timer = now + MIP_TCP_RTX_MS;
+}
+
+// RTO expired: re-send the front segment only (RFC-9293, 3.10.8) and back
+// off (RFC-6298, 5.5). A frame the driver refuses is tried at the next RTO.
+static void retransmit(struct mg_connection *c) {
+  struct connstate *s = (struct connstate *) (c + 1);
+  struct mg_tcpip_if *ifp = c->mgr->ifp;
+  uint8_t *buf = NULL, i;
+  uint64_t rto = MIP_TCP_RTX_MS;
+  uint32_t rem_ip;
+  size_t len = txq_next(s, &buf);
+  if (len == 0) return;
+  memcpy(&rem_ip, c->rem.ip, sizeof(rem_ip));
+  if (tx_tcp(ifp, s->mac, rem_ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
+             mg_htonl(s->txq_seq), mg_htonl(s->ack), buf, len) == (size_t) -1) {
+    mg_error(c, "retransmit");
+    return;
+  }
+  for (i = 0; i < s->txq_retries && rto < MIP_TCP_RTX_MAX_MS; i++) {
+    rto *= 2;
+    if (rto > MIP_TCP_RTX_MAX_MS) rto = MIP_TCP_RTX_MAX_MS;
+  }
+  s->txq_timer = ifp->now + rto;
+}
+
 long mg_io_send(struct mg_connection *c, const void *buf, size_t len) {
   struct mg_tcpip_if *ifp = c->mgr->ifp;
   struct connstate *s = (struct connstate *) (c + 1);
@@ -4794,17 +4866,29 @@ long mg_io_send(struct mg_connection *c, const void *buf, size_t len) {
   if (c->is_udp) {
     tx_udp(ifp, s->mac, ifp->ip, c->loc.port, dst_ip, c->rem.port, buf, len);
   } else {
-    size_t sent =
-        tx_tcp(ifp, s->mac, dst_ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
-               mg_htonl(s->seq), mg_htonl(s->ack), buf, len);
-    if (sent == 0) {
-      return MG_IO_WAIT;
-    } else if (sent == (size_t) -1) {
-      return MG_IO_ERR;
-    } else {
-      s->seq += (uint32_t) len;
-      if (s->ttype == MIP_TTYPE_ACK) settmout(c, MIP_TTYPE_KEEPALIVE);
+    bool was_empty = s->txq.len == 0;
+    size_t sent;
+    if (s->retransmit) {  // Keep at most one window in flight (RAM, WINC)
+      uint32_t in_flight = was_empty ? 0 : s->seq - s->txq_una;
+      if (in_flight >= MIP_TCP_WIN) return MG_IO_WAIT;
+      if (len > MIP_TCP_WIN - in_flight) len = MIP_TCP_WIN - in_flight;
+      if (was_empty) s->txq_seq = s->txq_una = s->seq;
+      if (!txq_add(s, buf, len)) return MG_IO_WAIT;
     }
+    sent = tx_tcp(ifp, s->mac, dst_ip, TH_PUSH | TH_ACK, c->loc.port,
+                  c->rem.port, mg_htonl(s->seq), mg_htonl(s->ack), buf, len);
+    if (sent == 0 || sent == (size_t) -1) {
+      if (s->retransmit)  // not sent: the caller keeps the data and retries
+        mg_iobuf_del(&s->txq, s->txq.len - len - sizeof(uint32_t),
+                     len + sizeof(uint32_t));
+      return sent == 0 ? MG_IO_WAIT : MG_IO_ERR;
+    }
+    s->seq += (uint32_t) len;
+    if (s->retransmit && was_empty) {
+      s->txq_timer = ifp->now + MIP_TCP_RTX_MS;
+      s->txq_retries = 0;
+    }
+    if (s->ttype == MIP_TTYPE_ACK) settmout(c, MIP_TTYPE_KEEPALIVE);
   }
   return (long) len;
 }
@@ -4935,6 +5019,8 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
     mg_hexdump(pkt->pay.buf, pkt->pay.len);
 #endif
     s->tmiss = 0;                         // Reset missed keep-alive counter
+    if (s->retransmit && (pkt->tcp->flags & TH_ACK))
+      txq_ack(s, mg_ntohl(pkt->tcp->ack), ifp->now);
     if (s->ttype == MIP_TTYPE_KEEPALIVE)  // Advance keep-alive timer
       settmout(c,
                MIP_TTYPE_KEEPALIVE);  // unless a former ACK timeout is pending
@@ -5147,6 +5233,10 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     struct connstate *s = (struct connstate *) (c + 1);
     uint32_t rem_ip;
     memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
+    if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
+      if (s->txq_retries < 255) s->txq_retries++;
+      retransmit(c);
+    }
     if (ifp->now > s->timer) {
       if (s->ttype == MIP_TTYPE_ARP) {
         mg_error(c, "ARP timeout");
@@ -5271,6 +5361,11 @@ void mg_connect_resolved(struct mg_connection *c) {
             &c->rem));
   mg_call(c, MG_EV_RESOLVE, NULL);
   c->is_connecting = 1;
+  if (!c->is_udp) {
+    struct connstate *cs = (struct connstate *) (c + 1);
+    cs->retransmit = ifp->enable_tcp_retransmit;
+    cs->txq.align = MIP_TCP_TXQ_ALIGN;
+  }
   if (c->is_udp && (rem_ip == 0xffffffff || rem_ip == (ifp->ip | ~ifp->mask))) {
     struct connstate *s = (struct connstate *) (c + 1);
     memset(s->mac, 0xFF, sizeof(s->mac));  // global or local broadcast
@@ -5328,6 +5423,7 @@ static void init_closure(struct mg_connection *c) {
 static void close_conn(struct mg_connection *c) {
   struct connstate *s = (struct connstate *) (c + 1);
   mg_iobuf_free(&s->raw);  // For TLS connections, release raw data
+  mg_iobuf_free(&s->txq);  // Retransmission queue
   mg_close_conn(c);
 }
 
@@ -5361,14 +5457,15 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
       flush = mg_tls_flush(c);
     if (flush == MG_IO_ERR) mg_error(c, "tx err");
     if (c->is_draining && c->send.len == 0 && flush == 0 &&
-        s->ttype != MIP_TTYPE_FIN)
+        s->txq.len == 0 && s->ttype != MIP_TTYPE_FIN)
       init_closure(c);
     // For non-TLS, close immediately upon completing the 3-way closure
     // For TLS, handle any pending data (above) until MIP_TTYPE_FIN expires
     if (s->twclosure &&
         (!c->is_tls || (c->rtls.len == 0 && mg_tls_pending(c) == 0)))
       c->is_closing = 1;
-    if (c->is_draining && c->send.len == 0 && flush == 0) c->is_closing = 1;
+    if (c->is_draining && c->send.len == 0 && flush == 0 && s->txq.len == 0)
+      c->is_closing = 1;
     if (c->is_closing) close_conn(c);
   }
   (void) ms;
