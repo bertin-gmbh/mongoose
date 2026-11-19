@@ -5474,8 +5474,12 @@ static void init_closure(struct mg_connection *c) {
       c->is_connecting == false) {  // For TCP conns,
     uint32_t rem_ip;
     memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
-    tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_FIN | TH_ACK, c->loc.port,
-           c->rem.port, mg_htonl(s->seq), mg_htonl(s->ack), NULL, 0);
+    // AS-115: a driver busy with the previous frame (USB RNDIS: one frame in
+    // flight; WINC queue full) refuses the FIN. Enter the FIN state only when
+    // it was sent; otherwise mg_mgr_poll() calls us again on the next poll.
+    if (tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_FIN | TH_ACK, c->loc.port,
+               c->rem.port, mg_htonl(s->seq), mg_htonl(s->ack), NULL, 0) == 0)
+      return;
     settmout(c, MIP_TTYPE_FIN);
   }
 }
@@ -5526,7 +5530,12 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     if (s->twclosure &&
         (!c->is_tls || (c->rtls.len == 0 && mg_tls_pending(c) == 0)))
       c->is_closing = 1;
-    if (c->is_draining && c->send.len == 0 && flush == 0 && s->txq.len == 0)
+    // AS-115 (7.24): a TCP connection is freed only after the 3-way closure
+    // (twclosure, above) or the FIN timeout. 7.17 freed it right after its FIN,
+    // so the peer's ACK hit no connection and got an RST, and the peer (Windows)
+    // dropped the unread response. Only conns that send no FIN close at once.
+    if (c->is_draining && c->send.len == 0 && flush == 0 && s->txq.len == 0 &&
+        (c->is_udp || c->is_listening || c->is_connecting))
       c->is_closing = 1;
     if (c->is_closing) close_conn(c);
   }
