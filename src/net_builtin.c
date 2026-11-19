@@ -824,14 +824,11 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
     if (s->fin_rcvd && s->ttype == MIP_TTYPE_FIN) s->twclosure = true;
     return; // no data to process
   } else if (seq != s->ack) {
-    uint32_t ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len);
-    if (s->ack == ack) {
-      MG_VERBOSE(("ignoring duplicate pkt"));
-    } else {
-      MG_VERBOSE(("SEQ != ACK: %x %x %x", seq, s->ack, ack));
-      tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_ACK, c->loc.port, c->rem.port,
-             mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
-    }
+    // Duplicate (our ACK got lost, the peer resends until it sees one) or
+    // out-of-order segment: ACK what we have (RFC-9293 3.10.7.4), drop it
+    MG_VERBOSE(("SEQ != ACK: %x %x", seq, s->ack));
+    tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_ACK, c->loc.port, c->rem.port,
+           mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
     return; // drop it
   }
   // Make room for the payload; FIN segments with data come here too. 7.17
@@ -1116,8 +1113,19 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     struct connstate *s = (struct connstate *) (c + 1);
     uint32_t rem_ip;
     memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
+    if (s->retransmit && c->is_connecting && s->ttype == MIP_TTYPE_SYN &&
+        ifp->now > s->txq_timer) {  // SYN or SYN-ACK lost: send SYN again
+      uint8_t shift = s->txq_retries < 6 ? s->txq_retries : 6;
+      if (s->txq_retries < 255) s->txq_retries++;
+      send_syn(c);
+      s->txq_timer = ifp->now + ((uint64_t) MIP_TCP_RTX_MS << (shift + 1));
+    }
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
+      if (s->txq_retries > 7) {  // ~38 s of RTOs: peer is gone, free its buffers
+        mg_error(c, "retransmit timeout");
+        continue;
+      }
       s->in_recovery = true, s->recover = s->seq;
       retransmit(c);
     }
@@ -1221,8 +1229,10 @@ static void mac_resolved(struct mg_connection *c) {
     c->is_connecting = 0;
     mg_call(c, MG_EV_CONNECT, NULL);
   } else {
+    struct connstate *s = (struct connstate *) (c + 1);
     send_syn(c);
     settmout(c, MIP_TTYPE_SYN);
+    s->txq_timer = c->mgr->ifp->now + MIP_TCP_RTX_MS, s->txq_retries = 0;
   }
 }
 
@@ -1335,9 +1345,11 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     if (c->is_tls && (c->rtls.len > 0 || mg_tls_pending(c) > 0))
       handle_tls_recv(c);
     if (can_write(c)) write_conn(c);
-    // Send TLS records refused earlier, even when c->send is empty (7.24)
+    // Send TLS records refused earlier, even when c->send is empty (7.24),
+    // and handshake records (a client's c->send waits for the handshake)
     if (c->is_tls && c->tls != NULL && !c->is_listening && !c->is_connecting &&
-        !c->is_resolving && !c->is_arplooking && c->send.len == 0)
+        !c->is_resolving && !c->is_arplooking &&
+        (c->send.len == 0 || c->is_tls_hs))
       flush = mg_tls_flush(c);
     if (flush == MG_IO_ERR) mg_error(c, "tx err");
     if (c->is_draining && c->send.len == 0 && flush == 0 &&

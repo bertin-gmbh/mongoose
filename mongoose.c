@@ -4986,14 +4986,11 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
     if (s->fin_rcvd && s->ttype == MIP_TTYPE_FIN) s->twclosure = true;
     return; // no data to process
   } else if (seq != s->ack) {
-    uint32_t ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len);
-    if (s->ack == ack) {
-      MG_VERBOSE(("ignoring duplicate pkt"));
-    } else {
-      MG_VERBOSE(("SEQ != ACK: %x %x %x", seq, s->ack, ack));
-      tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_ACK, c->loc.port, c->rem.port,
-             mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
-    }
+    // Duplicate (our ACK got lost, the peer resends until it sees one) or
+    // out-of-order segment: ACK what we have (RFC-9293 3.10.7.4), drop it
+    MG_VERBOSE(("SEQ != ACK: %x %x", seq, s->ack));
+    tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_ACK, c->loc.port, c->rem.port,
+           mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
     return; // drop it
   }
   // Make room for the payload; FIN segments with data come here too. 7.17
@@ -5278,8 +5275,19 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     struct connstate *s = (struct connstate *) (c + 1);
     uint32_t rem_ip;
     memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
+    if (s->retransmit && c->is_connecting && s->ttype == MIP_TTYPE_SYN &&
+        ifp->now > s->txq_timer) {  // SYN or SYN-ACK lost: send SYN again
+      uint8_t shift = s->txq_retries < 6 ? s->txq_retries : 6;
+      if (s->txq_retries < 255) s->txq_retries++;
+      send_syn(c);
+      s->txq_timer = ifp->now + ((uint64_t) MIP_TCP_RTX_MS << (shift + 1));
+    }
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
+      if (s->txq_retries > 7) {  // ~38 s of RTOs: peer is gone, free its buffers
+        mg_error(c, "retransmit timeout");
+        continue;
+      }
       s->in_recovery = true, s->recover = s->seq;
       retransmit(c);
     }
@@ -5383,8 +5391,10 @@ static void mac_resolved(struct mg_connection *c) {
     c->is_connecting = 0;
     mg_call(c, MG_EV_CONNECT, NULL);
   } else {
+    struct connstate *s = (struct connstate *) (c + 1);
     send_syn(c);
     settmout(c, MIP_TTYPE_SYN);
+    s->txq_timer = c->mgr->ifp->now + MIP_TCP_RTX_MS, s->txq_retries = 0;
   }
 }
 
@@ -5497,9 +5507,11 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     if (c->is_tls && (c->rtls.len > 0 || mg_tls_pending(c) > 0))
       handle_tls_recv(c);
     if (can_write(c)) write_conn(c);
-    // Send TLS records refused earlier, even when c->send is empty (7.24)
+    // Send TLS records refused earlier, even when c->send is empty (7.24),
+    // and handshake records (a client's c->send waits for the handshake)
     if (c->is_tls && c->tls != NULL && !c->is_listening && !c->is_connecting &&
-        !c->is_resolving && !c->is_arplooking && c->send.len == 0)
+        !c->is_resolving && !c->is_arplooking &&
+        (c->send.len == 0 || c->is_tls_hs))
       flush = mg_tls_flush(c);
     if (flush == MG_IO_ERR) mg_error(c, "tx err");
     if (c->is_draining && c->send.len == 0 && flush == 0 &&
@@ -11373,8 +11385,12 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   nonce[10] ^= (uint8_t) ((seq >> 8) & 255U);
   nonce[11] ^= (uint8_t) ((seq) &255U);
 
-  mg_iobuf_add(wio, wio->len, hdr, sizeof(hdr));
-  mg_iobuf_resize(wio, wio->len + encsz);
+  // AS-115: never write the record past a buffer that could not grow (7.24)
+  if (mg_iobuf_add(wio, wio->len, hdr, sizeof(hdr)) == 0 ||
+      !mg_iobuf_resize(wio, wio->len + encsz)) {
+    mg_error(c, "TLS OOM");
+    return;
+  }
   outmsg = wio->buf + wio->len;
   tag = wio->buf + wio->len + msgsz + 1;
   memmove(outmsg, msg, msgsz);
@@ -11382,8 +11398,9 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
 #if CHACHA20
   (void) tag;  // tag is only used in aes gcm
   {
-    size_t maxlen = MG_IO_SIZE > 16384 ? 16384 : MG_IO_SIZE;
-    uint8_t *enc = (uint8_t *) calloc(1, maxlen + 256 + 1);
+    // AS-115: size for this record (7.24); handshake records such as the
+    // certificate can be larger than MG_IO_SIZE and overflowed the heap
+    uint8_t *enc = (uint8_t *) calloc(1, msgsz + 256 + 1);
     if (enc == NULL) {
       mg_error(c, "TLS OOM");
       return;
@@ -11726,8 +11743,7 @@ static void mg_tls_server_send_finish(struct mg_connection *c) {
   mg_sha256_final(hash, &sha256);
   mg_hmac_sha256(finish + 4, tls->enc.server_finished_key, 32, hash, 32);
   mg_tls_encrypt(c, finish, sizeof(finish), MG_TLS_HANDSHAKE);
-  mg_io_send(c, wio->buf, wio->len);
-  wio->len = 0;
+  mg_tls_flush(c);  // keep what the driver refuses, mg_mgr_poll() resends it
 
   mg_sha256_update(&tls->sha256, finish, sizeof(finish));
 }
@@ -11853,8 +11869,7 @@ static void mg_tls_client_send_hello(struct mg_connection *c) {
 
   // change cipher message
   mg_iobuf_add(wio, wio->len, (const char *) "\x14\x03\x03\x00\x01\x01", 6);
-  mg_io_send(c, wio->buf, wio->len);
-  wio->len = 0;
+  mg_tls_flush(c);  // keep what the driver refuses, mg_mgr_poll() resends it
 }
 
 static int mg_tls_client_recv_hello(struct mg_connection *c) {
@@ -12411,8 +12426,7 @@ static void mg_tls_client_send_finish(struct mg_connection *c) {
   mg_sha256_final(hash, &sha256);
   mg_hmac_sha256(finish + 4, tls->enc.client_finished_key, 32, hash, 32);
   mg_tls_encrypt(c, finish, sizeof(finish), MG_TLS_HANDSHAKE);
-  mg_io_send(c, wio->buf, wio->len);
-  wio->len = 0;
+  mg_tls_flush(c);  // keep what the driver refuses, mg_mgr_poll() resends it
 }
 
 static void mg_tls_client_handshake(struct mg_connection *c) {
