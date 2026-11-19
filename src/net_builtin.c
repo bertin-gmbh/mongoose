@@ -13,7 +13,9 @@
 #define MIP_TCP_SYN_MS 15000  // Timeout for connection establishment
 #define MIP_TCP_FIN_MS 1000   // Timeout for closing connection
 #define MIP_TCP_WIN 6000      // TCP window size
+#ifndef MIP_TCP_RTX_MS
 #define MIP_TCP_RTX_MS 1000       // Initial retransmission timeout (RFC-6298, 2.1)
+#endif
 #define MIP_TCP_RTX_MAX_MS 60000  // Retransmission timeout cap (RFC-6298, 2.5)
 #define MIP_TCP_TXQ_ALIGN 1024    // Retransmit queue allocation quantum
 
@@ -36,6 +38,9 @@ struct connstate {
   // TCP retransmission, backport of Mongoose 7.24 (AS-115; RFC-6298, RFC-9293)
   bool retransmit;       // Retain sent data until acknowledged
   uint8_t txq_retries;   // Retransmissions since ACK progress
+  uint8_t dup_acks;      // Duplicate ACKs for txq_una (fast retransmit)
+  bool in_recovery;      // Loss recovery in progress (RFC-6582)
+  uint32_t recover;      // Highest sequence sent when the loss was detected
   uint32_t txq_seq;      // Sequence of the first txq record
   uint32_t txq_una;      // Oldest unacknowledged sequence
   uint64_t txq_timer;    // Retransmission timer
@@ -656,12 +661,26 @@ static bool txq_add(struct connstate *s, const void *buf, size_t len) {
   return true;
 }
 
+static bool txq_send_front(struct mg_connection *c);
+
 // Peer acknowledged up to ackno: drop entirely acknowledged segments
-// (RFC-9293, 3.10.7.4) and restart the RTO (RFC-6298, 5.3)
-static void txq_ack(struct connstate *s, uint32_t ackno, uint64_t now) {
+// (RFC-9293, 3.10.7.4) and restart the RTO (RFC-6298, 5.3). The third
+// duplicate ACK re-sends the front segment at once (fast retransmit,
+// RFC-5681, 3.2), so one lost frame costs a round trip instead of an RTO.
+static void txq_ack(struct mg_connection *c, uint32_t ackno, size_t paylen,
+                    uint64_t now) {
+  struct connstate *s = (struct connstate *) (c + 1);
   size_t len;
   if (s->txq.len == 0) return;
-  if ((int32_t) (ackno - s->txq_una) <= 0) return;  // old or duplicate ACK
+  if (ackno == s->txq_una) {  // duplicate ACK: the peer misses txq_seq
+    if (paylen == 0 && s->dup_acks < 255 && ++s->dup_acks == 3 &&
+        !s->in_recovery && txq_send_front(c)) {
+      s->in_recovery = true, s->recover = s->seq;
+      s->txq_timer = now + MIP_TCP_RTX_MS;
+    }
+    return;
+  }
+  if ((int32_t) (ackno - s->txq_una) < 0) return;  // old ACK
   if ((int32_t) (ackno - s->seq) > 0) return;       // ACKs unsent data
   while ((len = txq_next(s, NULL)) > 0 &&
          (int32_t) (ackno - (s->txq_seq + (uint32_t) len)) >= 0) {
@@ -670,25 +689,42 @@ static void txq_ack(struct connstate *s, uint32_t ackno, uint64_t now) {
   }
   s->txq_una = ackno;
   s->txq_retries = 0;
+  s->dup_acks = 0;
   s->txq_timer = now + MIP_TCP_RTX_MS;
+  if (s->in_recovery) {
+    if ((int32_t) (ackno - s->recover) >= 0) {
+      s->in_recovery = false;  // full ACK: everything in flight arrived
+    } else {
+      txq_send_front(c);  // partial ACK: the next segment is missing too
+    }
+  }
 }
 
 // RTO expired: re-send the front segment only (RFC-9293, 3.10.8) and back
 // off (RFC-6298, 5.5). A frame the driver refuses is tried at the next RTO.
+// Re-send the front txq segment; false if there is none or sending failed
+static bool txq_send_front(struct mg_connection *c) {
+  struct connstate *s = (struct connstate *) (c + 1);
+  uint8_t *buf = NULL;
+  uint32_t rem_ip;
+  size_t len = txq_next(s, &buf);
+  if (len == 0) return false;
+  memcpy(&rem_ip, c->rem.ip, sizeof(rem_ip));
+  if (tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_PUSH | TH_ACK, c->loc.port,
+             c->rem.port, mg_htonl(s->txq_seq), mg_htonl(s->ack), buf,
+             len) == (size_t) -1) {
+    mg_error(c, "retransmit");
+    return false;
+  }
+  return true;  // 0 (driver refused) is tried again at the next RTO
+}
+
 static void retransmit(struct mg_connection *c) {
   struct connstate *s = (struct connstate *) (c + 1);
   struct mg_tcpip_if *ifp = c->mgr->ifp;
-  uint8_t *buf = NULL, i;
+  uint8_t i;
   uint64_t rto = MIP_TCP_RTX_MS;
-  uint32_t rem_ip;
-  size_t len = txq_next(s, &buf);
-  if (len == 0) return;
-  memcpy(&rem_ip, c->rem.ip, sizeof(rem_ip));
-  if (tx_tcp(ifp, s->mac, rem_ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
-             mg_htonl(s->txq_seq), mg_htonl(s->ack), buf, len) == (size_t) -1) {
-    mg_error(c, "retransmit");
-    return;
-  }
+  if (!txq_send_front(c)) return;
   for (i = 0; i < s->txq_retries && rto < MIP_TCP_RTX_MAX_MS; i++) {
     rto *= 2;
     if (rto > MIP_TCP_RTX_MAX_MS) rto = MIP_TCP_RTX_MAX_MS;
@@ -858,7 +894,7 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
 #endif
     s->tmiss = 0;                         // Reset missed keep-alive counter
     if (s->retransmit && (pkt->tcp->flags & TH_ACK))
-      txq_ack(s, mg_ntohl(pkt->tcp->ack), ifp->now);
+      txq_ack(c, mg_ntohl(pkt->tcp->ack), pkt->pay.len, ifp->now);
     if (s->ttype == MIP_TTYPE_KEEPALIVE)  // Advance keep-alive timer
       settmout(c,
                MIP_TTYPE_KEEPALIVE);  // unless a former ACK timeout is pending
@@ -1073,6 +1109,7 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     memcpy(&rem_ip, c->rem.ip, sizeof(uint32_t));
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
+      s->in_recovery = true, s->recover = s->seq;
       retransmit(c);
     }
     if (ifp->now > s->timer) {
