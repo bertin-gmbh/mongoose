@@ -798,6 +798,11 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
     // If we didn't initiate it, we reply with FIN as part of the normal TCP
     // closure process
     uint8_t flags = TH_ACK;
+    if (seq != s->ack) {  // out-of-order or retransmitted FIN: just ACK (7.24)
+      tx_tcp(c->mgr->ifp, s->mac, rem_ip, TH_ACK, c->loc.port, c->rem.port,
+             mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
+      return;
+    }
     s->ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len + 1);
     s->fin_rcvd = true;
     if (c->is_draining && s->ttype == MIP_TTYPE_FIN) {
@@ -828,8 +833,11 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
              mg_htonl(s->seq), mg_htonl(s->ack), "", 0);
     }
     return; // drop it
-  } else if (io->size - io->len < pkt->pay.len &&
-             !mg_iobuf_resize(io, io->len + pkt->pay.len)) {
+  }
+  // Make room for the payload; FIN segments with data come here too. 7.17
+  // skipped this for them and copied past the end of the buffer (AS-115)
+  if (io->size - io->len < pkt->pay.len &&
+      !mg_iobuf_resize(io, io->len + pkt->pay.len)) {
     mg_error(c, "oom");
     return; // drop it
   }
@@ -841,8 +849,9 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
   memcpy(&io->buf[io->len], pkt->pay.buf, pkt->pay.len);
   io->len += pkt->pay.len;
   MG_VERBOSE(("%lu SEQ %x -> %x", c->id, mg_htonl(pkt->tcp->seq), s->ack));
-  // Advance ACK counter
-  s->ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len);
+  // Advance ACK counter (FIN already advanced it, including the FIN itself)
+  if (!(pkt->tcp->flags & TH_FIN))
+    s->ack = (uint32_t) (mg_htonl(pkt->tcp->seq) + pkt->pay.len);
   s->unacked += pkt->pay.len;
   // size_t diff = s->acked <= s->ack ? s->ack - s->acked : s->ack;
   if (s->unacked > MIP_TCP_WIN / 2 && s->acked != s->ack) {
