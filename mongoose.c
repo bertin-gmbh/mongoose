@@ -11696,6 +11696,19 @@ static void finish_SHA256(const MG_UECC_HashContext *base,
   mg_sha256_final(hash_result, &c->ctx);
 }
 
+// Encode a big-endian unsigned integer as a minimal DER INTEGER (tag, length,
+// value): no leading 0x00 unless the next byte has its top bit set. Returns the
+// number of bytes written (at most len + 3).
+static size_t der_uint(uint8_t *out, const uint8_t *v, size_t len) {
+  size_t n = 0;
+  while (len > 1 && v[0] == 0 && !(v[1] & 0x80)) v++, len--;
+  out[n++] = 0x02;  // ASN.1 INTEGER
+  out[n++] = (uint8_t) (len + (v[0] & 0x80 ? 1 : 0));
+  if (v[0] & 0x80) out[n++] = 0;
+  memmove(out + n, v, len);
+  return n + len;
+}
+
 static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
   struct tls_data *tls = (struct tls_data *) c->tls;
   // server certificate verify packet
@@ -11713,18 +11726,19 @@ static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
   mg_uecc_sign_deterministic(tls->ec_key, hash, sizeof(hash), &ctx.uECC, sig,
                              mg_uecc_secp256r1());
 
-  neg1 = !!(sig[0] & 0x80);
-  neg2 = !!(sig[32] & 0x80);
-  verify[8] = 0x30;  // ASN.1 SEQUENCE
-  verify[9] = (uint8_t) (68 + neg1 + neg2);
-  verify[10] = 0x02;  // ASN.1 INTEGER
-  verify[11] = (uint8_t) (32 + neg1);
-  memmove(verify + 12 + neg1, sig, 32);
-  verify[12 + 32 + neg1] = 0x02;  // ASN.1 INTEGER
-  verify[13 + 32 + neg1] = (uint8_t) (32 + neg2);
-  memmove(verify + 14 + 32 + neg1 + neg2, sig + 32, 32);
-
-  sigsz = (size_t) (70 + neg1 + neg2);
+  // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER } in minimal DER (AS-115):
+  // 7.17 always wrote 32 bytes, so an r or s starting with 0x00 (1 in 128
+  // handshakes) gave a non-minimal INTEGER that browsers reject (BAD_SIGNATURE)
+  {
+    uint8_t *p = verify + 10;
+    p += der_uint(p, sig, 32);
+    p += der_uint(p, sig + 32, 32);
+    verify[8] = 0x30;  // ASN.1 SEQUENCE
+    verify[9] = (uint8_t) (p - (verify + 10));
+    sigsz = (size_t) (p - (verify + 8));
+  }
+  (void) neg1;
+  (void) neg2;
   verifysz = 8U + sigsz;
   verify[3] = (uint8_t) (sigsz + 4);
   verify[7] = (uint8_t) sigsz;
