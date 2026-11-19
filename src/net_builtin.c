@@ -655,9 +655,13 @@ static bool txq_add(struct connstate *s, const void *buf, size_t len) {
   uint32_t n = (uint32_t) len;
   size_t off = s->txq.len, total = sizeof(n) + len;
   if (len == 0) return true;
-  if (mg_iobuf_add(&s->txq, off, NULL, total) != total) return false;
+  // Only grow: mg_iobuf_add() would also shrink the buffer, i.e. calloc +
+  // copy + free for every segment (heap churn and fragmentation, AS-115)
+  if (off + total > s->txq.size && !mg_iobuf_resize(&s->txq, off + total))
+    return false;
   memcpy(s->txq.buf + off, &n, sizeof(n));
   memcpy(s->txq.buf + off + sizeof(n), buf, len);
+  s->txq.len = off + total;
   return true;
 }
 
@@ -1122,7 +1126,7 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     }
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
-      if (s->txq_retries > 7) {  // ~38 s of RTOs: peer is gone, free its buffers
+      if (s->txq_retries > 7) {  // 8 RTOs (300 ms x 255 = 76.5 s): peer gone, free
         mg_error(c, "retransmit timeout");
         continue;
       }

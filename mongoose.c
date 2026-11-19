@@ -4817,9 +4817,13 @@ static bool txq_add(struct connstate *s, const void *buf, size_t len) {
   uint32_t n = (uint32_t) len;
   size_t off = s->txq.len, total = sizeof(n) + len;
   if (len == 0) return true;
-  if (mg_iobuf_add(&s->txq, off, NULL, total) != total) return false;
+  // Only grow: mg_iobuf_add() would also shrink the buffer, i.e. calloc +
+  // copy + free for every segment (heap churn and fragmentation, AS-115)
+  if (off + total > s->txq.size && !mg_iobuf_resize(&s->txq, off + total))
+    return false;
   memcpy(s->txq.buf + off, &n, sizeof(n));
   memcpy(s->txq.buf + off + sizeof(n), buf, len);
+  s->txq.len = off + total;
   return true;
 }
 
@@ -5284,7 +5288,7 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     }
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
-      if (s->txq_retries > 7) {  // ~38 s of RTOs: peer is gone, free its buffers
+      if (s->txq_retries > 7) {  // 8 RTOs (300 ms x 255 = 76.5 s): peer gone, free
         mg_error(c, "retransmit timeout");
         continue;
       }
@@ -11386,8 +11390,12 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   nonce[11] ^= (uint8_t) ((seq) &255U);
 
   // AS-115: never write the record past a buffer that could not grow (7.24)
-  if (mg_iobuf_add(wio, wio->len, hdr, sizeof(hdr)) == 0 ||
-      !mg_iobuf_resize(wio, wio->len + encsz)) {
+  if (mg_iobuf_add(wio, wio->len, hdr, sizeof(hdr)) == 0) {
+    mg_error(c, "TLS OOM");
+    return;
+  }
+  if (!mg_iobuf_resize(wio, wio->len + encsz)) {
+    wio->len -= sizeof(hdr);  // do not leave a header without its record
     mg_error(c, "TLS OOM");
     return;
   }
@@ -11699,7 +11707,8 @@ static void finish_SHA256(const MG_UECC_HashContext *base,
 // Encode a big-endian unsigned integer as a minimal DER INTEGER (tag, length,
 // value): no leading 0x00 unless the next byte has its top bit set. Returns the
 // number of bytes written (at most len + 3).
-static size_t der_uint(uint8_t *out, const uint8_t *v, size_t len) {
+size_t mg_der_uint(uint8_t *out, const uint8_t *v, size_t len);  // host test
+size_t mg_der_uint(uint8_t *out, const uint8_t *v, size_t len) {
   size_t n = 0;
   while (len > 1 && v[0] == 0 && !(v[1] & 0x80)) v++, len--;
   out[n++] = 0x02;  // ASN.1 INTEGER
@@ -11731,8 +11740,8 @@ static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
   // handshakes) gave a non-minimal INTEGER that browsers reject (BAD_SIGNATURE)
   {
     uint8_t *p = verify + 10;
-    p += der_uint(p, sig, 32);
-    p += der_uint(p, sig + 32, 32);
+    p += mg_der_uint(p, sig, 32);
+    p += mg_der_uint(p, sig + 32, 32);
     verify[8] = 0x30;  // ASN.1 SEQUENCE
     verify[9] = (uint8_t) (p - (verify + 10));
     sigsz = (size_t) (p - (verify + 8));
@@ -11749,7 +11758,6 @@ static void mg_tls_send_cert_verify(struct mg_connection *c, int is_client) {
 
 static void mg_tls_server_send_finish(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
-  struct mg_iobuf *wio = &tls->send;
   mg_sha256_ctx sha256;
   uint8_t hash[32];
   uint8_t finish[36] = {0x14, 0, 0, 32};
@@ -12432,7 +12440,6 @@ static int mg_tls_client_recv_finish(struct mg_connection *c) {
 
 static void mg_tls_client_send_finish(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
-  struct mg_iobuf *wio = &tls->send;
   mg_sha256_ctx sha256;
   uint8_t hash[32];
   uint8_t finish[36] = {0x14, 0, 0, 32};
