@@ -2422,6 +2422,7 @@ struct mg_tls_opts {
 void mg_tls_init(struct mg_connection *, const struct mg_tls_opts *opts);
 void mg_tls_free(struct mg_connection *);
 long mg_tls_send(struct mg_connection *, const void *buf, size_t len);
+long mg_tls_flush(struct mg_connection *);  // Re-send throttled records
 long mg_tls_recv(struct mg_connection *, void *buf, size_t len);
 size_t mg_tls_pending(struct mg_connection *);
 void mg_tls_handshake(struct mg_connection *);

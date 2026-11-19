@@ -270,6 +270,11 @@ long mg_tls_send(struct mg_connection *c, const void *buf, size_t len) {
   return n;
 }
 
+long mg_tls_flush(struct mg_connection *c) {
+  (void) c;
+  return 0;
+}
+
 void mg_tls_ctx_init(struct mg_mgr *mgr) {
   (void) mgr;
 }

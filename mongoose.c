@@ -5345,6 +5345,7 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
   for (c = mgr->conns; c != NULL; c = tmp) {
     tmp = c->next;
     struct connstate *s = (struct connstate *) (c + 1);
+    long flush = 0;
     mg_call(c, MG_EV_POLL, &now);
     MG_VERBOSE(("%lu .. %c%c%c%c%c %lu %lu", c->id, c->is_tls ? 'T' : 't',
                 c->is_connecting ? 'C' : 'c', c->is_tls_hs ? 'H' : 'h',
@@ -5354,14 +5355,20 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     if (c->is_tls && (c->rtls.len > 0 || mg_tls_pending(c) > 0))
       handle_tls_recv(c);
     if (can_write(c)) write_conn(c);
-    if (c->is_draining && c->send.len == 0 && s->ttype != MIP_TTYPE_FIN)
+    // Send TLS records refused earlier, even when c->send is empty (7.24)
+    if (c->is_tls && c->tls != NULL && !c->is_listening && !c->is_connecting &&
+        !c->is_resolving && !c->is_arplooking && c->send.len == 0)
+      flush = mg_tls_flush(c);
+    if (flush == MG_IO_ERR) mg_error(c, "tx err");
+    if (c->is_draining && c->send.len == 0 && flush == 0 &&
+        s->ttype != MIP_TTYPE_FIN)
       init_closure(c);
     // For non-TLS, close immediately upon completing the 3-way closure
     // For TLS, handle any pending data (above) until MIP_TTYPE_FIN expires
     if (s->twclosure &&
         (!c->is_tls || (c->rtls.len == 0 && mg_tls_pending(c) == 0)))
       c->is_closing = 1;
-    if (c->is_draining && c->send.len == 0) c->is_closing = 1;
+    if (c->is_draining && c->send.len == 0 && flush == 0) c->is_closing = 1;
     if (c->is_closing) close_conn(c);
   }
   (void) ms;
@@ -12537,6 +12544,22 @@ size_t mg_tls_pending(struct mg_connection *c) {
   return tls != NULL ? tls->recv_len : 0;
 }
 
+// Re-send TLS records refused earlier (c->is_tls_throttled). mg_tls_send()
+// only re-sends them when it is called again, which needs c->send.len > 0;
+// mg_mgr_poll() calls this when c->send is empty (backport from 7.24).
+long mg_tls_flush(struct mg_connection *c) {
+  struct tls_data *tls = (struct tls_data *) c->tls;
+  long n = 0;
+  if (tls == NULL) return 0;
+  while (tls->send.len > 0 &&
+         (n = mg_io_send(c, tls->send.buf, tls->send.len)) > 0) {
+    mg_iobuf_del(&tls->send, 0, (size_t) n);
+  }
+  if (n == MG_IO_ERR) return n;
+  c->is_tls_throttled = tls->send.len > 0;
+  return c->is_tls_throttled ? MG_IO_WAIT : 0;
+}
+
 void mg_tls_ctx_init(struct mg_mgr *mgr) {
   (void) mgr;
 }
@@ -13919,6 +13942,11 @@ size_t mg_tls_pending(struct mg_connection *c) {
   (void) c;
   return 0;
 }
+long mg_tls_flush(struct mg_connection *c) {
+  (void) c;
+  return 0;
+}
+
 void mg_tls_ctx_init(struct mg_mgr *mgr) {
   (void) mgr;
 }
@@ -14139,6 +14167,11 @@ long mg_tls_send(struct mg_connection *c, const void *buf, size_t len) {
   }
   if (n <= 0) return MG_IO_ERR;
   return n;
+}
+
+long mg_tls_flush(struct mg_connection *c) {
+  (void) c;
+  return 0;
 }
 
 void mg_tls_ctx_init(struct mg_mgr *mgr) {
@@ -14444,6 +14477,11 @@ long mg_tls_send(struct mg_connection *c, const void *buf, size_t len) {
   if (n < 0 && mg_tls_err(c, tls, n) == 0) return MG_IO_WAIT;
   if (n <= 0) return MG_IO_ERR;
   return n;
+}
+
+long mg_tls_flush(struct mg_connection *c) {
+  (void) c;
+  return 0;
 }
 
 void mg_tls_ctx_init(struct mg_mgr *mgr) {

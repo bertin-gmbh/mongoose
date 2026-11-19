@@ -1740,6 +1740,22 @@ size_t mg_tls_pending(struct mg_connection *c) {
   return tls != NULL ? tls->recv_len : 0;
 }
 
+// Re-send TLS records refused earlier (c->is_tls_throttled). mg_tls_send()
+// only re-sends them when it is called again, which needs c->send.len > 0;
+// mg_mgr_poll() calls this when c->send is empty (backport from 7.24).
+long mg_tls_flush(struct mg_connection *c) {
+  struct tls_data *tls = (struct tls_data *) c->tls;
+  long n = 0;
+  if (tls == NULL) return 0;
+  while (tls->send.len > 0 &&
+         (n = mg_io_send(c, tls->send.buf, tls->send.len)) > 0) {
+    mg_iobuf_del(&tls->send, 0, (size_t) n);
+  }
+  if (n == MG_IO_ERR) return n;
+  c->is_tls_throttled = tls->send.len > 0;
+  return c->is_tls_throttled ? MG_IO_WAIT : 0;
+}
+
 void mg_tls_ctx_init(struct mg_mgr *mgr) {
   (void) mgr;
 }
