@@ -2855,6 +2855,24 @@ enum {
   MG_TCPIP_EV_USER              // Starting ID for user events
 };
 
+// AS-115: limits of the TCP retransmission queue (txq, ifp->enable_tcp_retransmit),
+// which keeps every sent segment until the peer acknowledges it.
+#ifndef MIP_TCP_TXQ_MAX
+// Largest txq of one connection, bytes. A connection has at most MIP_TCP_WIN
+// (6000) bytes in flight; with MTU-sized segments that is 5 records of 4-byte
+// length + payload = 6020 bytes, 6144 in the 1024-byte allocation quantum. So
+// the cap binds only in rare cases (a partially acknowledged segment, many tiny
+// segments); the next segment is then shortened or waits for an ACK.
+#define MIP_TCP_TXQ_MAX 6144
+#endif
+// Free-heap guard: the txq does not grow when fewer than MG_HEAP_RESERVE bytes
+// of heap would stay free after the allocation; the data waits in the send
+// buffer instead (backpressure, no error). MG_FREE_HEAP() returns the free heap
+// in bytes (e.g. xPortGetFreeHeapSize() on FreeRTOS); not defined: no check.
+#ifndef MG_HEAP_RESERVE
+#define MG_HEAP_RESERVE 16384
+#endif
+
 // Network interface
 struct mg_tcpip_if {
   uint8_t mac[6];                  // MAC address. Must be set to a valid MAC

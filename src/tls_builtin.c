@@ -1654,7 +1654,7 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
   // server CA certificate, store serial number
   if (opts->ca.len > 0) {
     if (mg_parse_pem(opts->ca, mg_str_s("CERTIFICATE"), &tls->ca_der) < 0) {
-      MG_ERROR(("Failed to load certificate"));
+      mg_error(c, "Failed to load CA certificate");  // AS-115: was MG_ERROR
       return;
     }
   }
@@ -1666,7 +1666,7 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
 
   // parse PEM or DER certificate
   if (mg_parse_pem(opts->cert, mg_str_s("CERTIFICATE"), &tls->cert_der) < 0) {
-    MG_ERROR(("Failed to load certificate"));
+    mg_error(c, "Failed to load certificate");  // AS-115: was MG_ERROR
     return;
   }
 
@@ -1677,22 +1677,27 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
   }
 
   if (mg_parse_pem(opts->key, mg_str_s("EC PRIVATE KEY"), &key) == 0) {
-    if (key.len < 39) {
-      MG_ERROR(("EC private key too short"));
-      return;
-    }
-    // expect ASN.1 SEQUENCE=[INTEGER=1, BITSTRING of 32 bytes, ...]
+    // AS-115: a bad key failed only with MG_ERROR (or not at all for bad data),
+    // the handshake went on with a zero key, and the decoded key leaked. Now
+    // the decoded key is wiped and freed on every path; a bad key fails the
+    // connection. Expect ASN.1 SEQUENCE=[INTEGER=1, BITSTRING of 32 bytes, ...]
     // 30 nn 02 01 01 04 20 [key] ...
-    if (key.buf[0] != 0x30 || (key.buf[1] & 0x80) != 0) {
-      MG_ERROR(("EC private key: ASN.1 bad sequence"));
-      return;
+    const char *err = NULL;
+    if (key.buf == NULL || key.len < 39) {
+      err = "EC private key too short";
+    } else if (key.buf[0] != 0x30 || (key.buf[1] & 0x80) != 0) {
+      err = "EC private key: ASN.1 bad sequence";
+    } else if (memcmp(key.buf + 2, "\x02\x01\x01\x04\x20", 5) != 0) {
+      err = "EC private key: ASN.1 bad data";
+    } else {
+      memmove(tls->ec_key, key.buf + 7, 32);
     }
-    if (memcmp(key.buf + 2, "\x02\x01\x01\x04\x20", 5) != 0) {
-      MG_ERROR(("EC private key: ASN.1 bad data"));
-    }
-    memmove(tls->ec_key, key.buf + 7, 32);
+    if (key.buf != NULL) mg_bzero((volatile unsigned char *) key.buf, key.len);
     free((void *) key.buf);
+    if (err != NULL) mg_error(c, "%s", err);
   } else if (mg_parse_pem(opts->key, mg_str_s("PRIVATE KEY"), &key) == 0) {
+    if (key.buf != NULL) mg_bzero((volatile unsigned char *) key.buf, key.len);
+    free((void *) key.buf);  // AS-115: leaked
     mg_error(c, "PKCS8 private key format is not supported");
   } else {
     mg_error(c, "Expected EC PRIVATE KEY or PRIVATE KEY");

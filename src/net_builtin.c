@@ -18,6 +18,11 @@
 #endif
 #define MIP_TCP_RTX_MAX_MS 60000  // Retransmission timeout cap (RFC-6298, 2.5)
 #define MIP_TCP_TXQ_ALIGN 1024    // Retransmit queue allocation quantum
+// Retransmit queue for a whole window: MIP_TCP_WIN plus the 4-byte length of
+// up to 8 segments (5 with MTU-sized ones), in the allocation quantum: 6144
+#define MIP_TCP_TXQ_WIN_SIZE \
+  ((MIP_TCP_WIN + 8 * 4 + MIP_TCP_TXQ_ALIGN - 1) / MIP_TCP_TXQ_ALIGN * \
+   MIP_TCP_TXQ_ALIGN)
 
 struct connstate {
   uint32_t seq, ack;           // TCP seq/ack counters
@@ -651,14 +656,55 @@ static size_t txq_next(struct connstate *s, uint8_t **buf) {
   return len;
 }
 
+// AS-115: would fewer than MG_HEAP_RESERVE bytes of heap stay free after
+// allocating need bytes? (false when the free heap is unknown). Seven parallel
+// TLS connections over Wi-Fi drained the device heap with their txqs (296
+// failed callocs), which starves the rest of the firmware too. The txq stays
+// allocated until the connection closes: a connection that has one can always
+// go on sending (shorter segments); only one without a txq waits for heap.
+static bool txq_heap_tight(size_t need) {
+#ifdef MG_FREE_HEAP
+  size_t free_heap = (size_t) MG_FREE_HEAP();
+  return free_heap < need || free_heap - need < MG_HEAP_RESERVE;
+#else
+  (void) need;
+  return false;
+#endif
+}
+
+// Room for a segment of len bytes in the txq: len if it fits or the txq may
+// grow for it, else what is left of the allocated buffer (0: wait for ACKs or
+// heap). The txq does not grow beyond MIP_TCP_TXQ_MAX, nor when the heap is
+// tight; such a refusal is backpressure, not an error, so nothing is logged.
+// The first growth allocates the whole window (MIP_TCP_TXQ_WIN_SIZE) at once:
+// growing in 1 KB steps cost up to six calloc + copy + free per connection and
+// fragmented the heap with 6-8 parallel connections. Only when the heap is too
+// tight for that does it grow by what this segment needs. It never shrinks:
+// mg_iobuf_add() would, i.e. calloc + copy + free for every segment (AS-115).
+static size_t txq_room(struct connstate *s, size_t len) {
+  size_t off = s->txq.len, hdr = sizeof(uint32_t), need = off + hdr + len;
+  size_t align = s->txq.align > 0 ? s->txq.align : 1;
+  size_t size = (need + align - 1) / align * align;  // as mg_iobuf_resize()
+  size_t want = MIP_TCP_TXQ_WIN_SIZE < MIP_TCP_TXQ_MAX ? MIP_TCP_TXQ_WIN_SIZE
+                                                       : MIP_TCP_TXQ_MAX;
+  if (len == 0 || need <= s->txq.size) return len;
+  if (want < size) want = size;
+  if (size <= MIP_TCP_TXQ_MAX) {
+    if (!txq_heap_tight(want)) {  // a failed calloc is an error: no 2nd try
+      if (mg_iobuf_resize(&s->txq, want)) return len;
+    } else if (want > size && !txq_heap_tight(size) &&
+               mg_iobuf_resize(&s->txq, need)) {
+      return len;
+    }
+  }
+  return s->txq.size > off + hdr ? s->txq.size - off - hdr : 0;
+}
+
 static bool txq_add(struct connstate *s, const void *buf, size_t len) {
   uint32_t n = (uint32_t) len;
   size_t off = s->txq.len, total = sizeof(n) + len;
   if (len == 0) return true;
-  // Only grow: mg_iobuf_add() would also shrink the buffer, i.e. calloc +
-  // copy + free for every segment (heap churn and fragmentation, AS-115)
-  if (off + total > s->txq.size && !mg_iobuf_resize(&s->txq, off + total))
-    return false;
+  if (off + total > s->txq.size) return false;  // txq_room() makes room
   memcpy(s->txq.buf + off, &n, sizeof(n));
   memcpy(s->txq.buf + off + sizeof(n), buf, len);
   s->txq.len = off + total;
@@ -750,6 +796,9 @@ long mg_io_send(struct mg_connection *c, const void *buf, size_t len) {
       uint32_t in_flight = was_empty ? 0 : s->seq - s->txq_una;
       if (in_flight >= MIP_TCP_WIN) return MG_IO_WAIT;
       if (len > MIP_TCP_WIN - in_flight) len = MIP_TCP_WIN - in_flight;
+      // txq full or heap tight: the rest stays in the send buffer, and
+      // mg_mgr_poll() offers it again on every poll; ACKs (or the RTO) make room
+      if (len > 0 && (len = txq_room(s, len)) == 0) return MG_IO_WAIT;
       if (was_empty) s->txq_seq = s->txq_una = s->seq;
       if (!txq_add(s, buf, len)) return MG_IO_WAIT;
     }
