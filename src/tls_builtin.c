@@ -1710,6 +1710,9 @@ void mg_tls_free(struct mg_connection *c) {
     mg_iobuf_free(&tls->send);
     free((void *) tls->cert_der.buf);
     free((void *) tls->ca_der.buf);
+    // AS-115: do not leave the private key copy (ec_key) and the session keys
+    // in the freed heap
+    mg_bzero((volatile unsigned char *) tls, sizeof(*tls));
   }
   free(c->tls);
   c->tls = NULL;

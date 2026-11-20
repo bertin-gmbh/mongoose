@@ -4212,6 +4212,7 @@ struct connstate {
   uint32_t txq_una;      // Oldest unacknowledged sequence
   uint64_t txq_timer;    // Retransmission timer
   struct mg_iobuf txq;   // Length-prefixed sent TCP segments
+  bool txq_oom_logged;   // A failed txq calloc was logged (once, AS-115)
 };
 
 #pragma pack(push, 1)
@@ -4822,8 +4823,9 @@ static size_t txq_next(struct connstate *s, uint8_t **buf) {
 // allocating need bytes? (false when the free heap is unknown). Seven parallel
 // TLS connections over Wi-Fi drained the device heap with their txqs (296
 // failed callocs), which starves the rest of the firmware too. The txq stays
-// allocated until the connection closes: a connection that has one can always
+// allocated while the connection sends: a connection that has one can always
 // go on sending (shorter segments); only one without a txq waits for heap.
+// An idle connection gives its txq back (mg_mgr_poll()).
 static bool txq_heap_tight(size_t need) {
 #ifdef MG_FREE_HEAP
   size_t free_heap = (size_t) MG_FREE_HEAP();
@@ -4834,6 +4836,23 @@ static bool txq_heap_tight(size_t need) {
 #endif
 }
 
+static size_t txq_align(struct connstate *s, size_t n) {
+  size_t align = s->txq.align > 0 ? s->txq.align : 1;
+  return (n + align - 1) / align * align;  // as mg_iobuf_resize()
+}
+
+// Grow the txq to size bytes, as mg_iobuf_resize() but without its MG_ERROR
+// on a failed calloc: txq_room() logs that once per connection (AS-115)
+static bool txq_grow(struct connstate *s, size_t size) {
+  unsigned char *p = (unsigned char *) calloc(1, size);
+  if (p == NULL) return false;
+  if (s->txq.len > 0) memcpy(p, s->txq.buf, s->txq.len);
+  mg_bzero(s->txq.buf, s->txq.size);
+  free(s->txq.buf);
+  s->txq.buf = p, s->txq.size = size;
+  return true;
+}
+
 // Room for a segment of len bytes in the txq: len if it fits or the txq may
 // grow for it, else what is left of the allocated buffer (0: wait for ACKs or
 // heap). The txq does not grow beyond MIP_TCP_TXQ_MAX, nor when the heap is
@@ -4841,22 +4860,32 @@ static bool txq_heap_tight(size_t need) {
 // The first growth allocates the whole window (MIP_TCP_TXQ_WIN_SIZE) at once:
 // growing in 1 KB steps cost up to six calloc + copy + free per connection and
 // fragmented the heap with 6-8 parallel connections. Only when the heap is too
-// tight for that does it grow by what this segment needs. It never shrinks:
-// mg_iobuf_add() would, i.e. calloc + copy + free for every segment (AS-115).
+// tight for that, or the calloc fails (MG_FREE_HEAP() is the total free heap,
+// not the largest free block), does it grow by what this segment needs. It
+// never shrinks: mg_iobuf_add() would, i.e. calloc + copy + free for every
+// segment; mg_mgr_poll() frees it when the connection is idle (AS-115).
 static size_t txq_room(struct connstate *s, size_t len) {
   size_t off = s->txq.len, hdr = sizeof(uint32_t), need = off + hdr + len;
-  size_t align = s->txq.align > 0 ? s->txq.align : 1;
-  size_t size = (need + align - 1) / align * align;  // as mg_iobuf_resize()
-  size_t want = MIP_TCP_TXQ_WIN_SIZE < MIP_TCP_TXQ_MAX ? MIP_TCP_TXQ_WIN_SIZE
-                                                       : MIP_TCP_TXQ_MAX;
+  size_t size = txq_align(s, need);
+  size_t want = txq_align(s, MIP_TCP_TXQ_WIN_SIZE < MIP_TCP_TXQ_MAX
+                                 ? MIP_TCP_TXQ_WIN_SIZE
+                                 : MIP_TCP_TXQ_MAX);
+  bool failed = false;
   if (len == 0 || need <= s->txq.size) return len;
-  if (want < size) want = size;
   if (size <= MIP_TCP_TXQ_MAX) {
-    if (!txq_heap_tight(want)) {  // a failed calloc is an error: no 2nd try
-      if (mg_iobuf_resize(&s->txq, want)) return len;
-    } else if (want > size && !txq_heap_tight(size) &&
-               mg_iobuf_resize(&s->txq, need)) {
-      return len;
+    if (want > size && !txq_heap_tight(want)) {
+      if (txq_grow(s, want)) return len;
+      failed = true;  // e.g. no free block that large: try the segment's size
+    }
+    if (!txq_heap_tight(size)) {
+      if (txq_grow(s, size)) return len;
+      failed = true;
+    }
+    // Asked again on every poll: log the first failure of a connection only
+    if (failed && !s->txq_oom_logged) {
+      s->txq_oom_logged = true;
+      MG_ERROR(("txq %lu->%lu: out of memory", (unsigned long) s->txq.size,
+                (unsigned long) size));
     }
   }
   return s->txq.size > off + hdr ? s->txq.size - off - hdr : 0;
@@ -5571,6 +5600,13 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
         (c->send.len == 0 || c->is_tls_hs))
       flush = mg_tls_flush(c);
     if (flush == MG_IO_ERR) mg_error(c, "tx err");
+    // AS-115: an idle connection (nothing unacknowledged, nothing waiting to be
+    // sent) frees its txq. Kept, the txqs (up to 6 KB) of idle keep-alive
+    // connections held the heap the guard (txq_heap_tight()) leaves for txqs,
+    // and a new connection waited until a client closed one. Sending again
+    // costs one calloc per burst; while data waits the txq is not freed.
+    if (s->txq.size > 0 && s->txq.len == 0 && c->send.len == 0 && flush == 0)
+      mg_iobuf_free(&s->txq);
     if (c->is_draining && c->send.len == 0 && flush == 0 &&
         s->txq.len == 0 && s->ttype != MIP_TTYPE_FIN)
       init_closure(c);
@@ -12731,6 +12767,9 @@ void mg_tls_free(struct mg_connection *c) {
     mg_iobuf_free(&tls->send);
     free((void *) tls->cert_der.buf);
     free((void *) tls->ca_der.buf);
+    // AS-115: do not leave the private key copy (ec_key) and the session keys
+    // in the freed heap
+    mg_bzero((volatile unsigned char *) tls, sizeof(*tls));
   }
   free(c->tls);
   c->tls = NULL;
