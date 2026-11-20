@@ -4178,7 +4178,24 @@ void mg_mgr_init(struct mg_mgr *mgr) {
 #ifndef MIP_TCP_RTX_MS
 #define MIP_TCP_RTX_MS 1000       // Initial retransmission timeout (RFC-6298, 2.1)
 #endif
+#ifndef MIP_TCP_RTX_MAX_MS
 #define MIP_TCP_RTX_MAX_MS 60000  // Retransmission timeout cap (RFC-6298, 2.5)
+#endif
+// RTOs without ACK progress after which the connection is dropped
+// ("retransmit timeout"). The RTO doubles from MIP_TCP_RTX_MS up to
+// MIP_TCP_RTX_MAX_MS, so the give-up time is the sum of
+// min(MIP_TCP_RTX_MS * 2^k, MIP_TCP_RTX_MAX_MS) for k = 0 .. TRIES - 1;
+// defaults: 1 s * (2^8 - 1) = 255 s. A local-link profile (short cap, more
+// tries) recovers within one cap after an outage and gives up as early.
+#ifndef MIP_TCP_RTX_TRIES
+#define MIP_TCP_RTX_TRIES 8
+#endif
+#if MIP_TCP_RTX_TRIES < 1 || MIP_TCP_RTX_TRIES > 255
+#error "MIP_TCP_RTX_TRIES must be 1..255 (uint8_t txq_retries)"
+#endif
+#if MIP_TCP_RTX_MAX_MS < MIP_TCP_RTX_MS
+#error "MIP_TCP_RTX_MAX_MS must not be below MIP_TCP_RTX_MS"
+#endif
 #define MIP_TCP_TXQ_ALIGN 1024    // Retransmit queue allocation quantum
 // Retransmit queue for a whole window: MIP_TCP_WIN plus the 4-byte length of
 // up to 8 segments (5 with MTU-sized ones), in the allocation quantum: 6144
@@ -5360,13 +5377,15 @@ static void mg_tcpip_poll(struct mg_tcpip_if *ifp, uint64_t now) {
     if (s->retransmit && c->is_connecting && s->ttype == MIP_TTYPE_SYN &&
         ifp->now > s->txq_timer) {  // SYN or SYN-ACK lost: send SYN again
       uint8_t shift = s->txq_retries < 6 ? s->txq_retries : 6;
+      uint64_t rto = (uint64_t) MIP_TCP_RTX_MS << (shift + 1);
+      if (rto > MIP_TCP_RTX_MAX_MS) rto = MIP_TCP_RTX_MAX_MS;  // as retransmit()
       if (s->txq_retries < 255) s->txq_retries++;
       send_syn(c);
-      s->txq_timer = ifp->now + ((uint64_t) MIP_TCP_RTX_MS << (shift + 1));
+      s->txq_timer = ifp->now + rto;
     }
     if (s->retransmit && s->txq.len > 0 && ifp->now > s->txq_timer) {
       if (s->txq_retries < 255) s->txq_retries++;
-      if (s->txq_retries > 7) {  // 8 RTOs (300 ms x 255 = 76.5 s): peer gone, free
+      if (s->txq_retries >= MIP_TCP_RTX_TRIES) {  // peer gone: free
         mg_error(c, "retransmit timeout");
         continue;
       }
